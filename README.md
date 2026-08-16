@@ -343,15 +343,70 @@ should agree, and the size of the disagreement is a usable measure of how much
 to trust either. The onboard one is treated as optional — failing to open it
 logs a warning and the module continues.
 
+### Calibrating the magnetometer
+
+The BMM150 sits a few centimetres from the Tab5's speaker, and the speaker's
+permanent magnet adds a fixed vector in sensor frame that is comparable in
+size to Earth's field. Uncorrected, |B| swings between roughly a quarter and
+double the true value as the board turns, and any heading from it is
+meaningless.
+
+That is the classic hard-iron error and it subtracts out. Set
+`MAG_CALIBRATE 1` in `imu_example.c`, rebuild, and tumble the whole assembly
+slowly through every orientation for a minute — a full turn about each of the
+three axes is the goal. It prints the offsets ready to paste back into
+`MAG_OFFSET`:
+
+```
+W tab5_imu: calibration complete:
+W tab5_imu:   X: min   -17.0  max   +89.0  offset   +36.0  radius   53.0 uT
+W tab5_imu:   Y: min   -20.0  max   +92.0  offset   +36.0  radius   56.0 uT
+W tab5_imu:   Z: min   -35.0  max   +71.0  offset   +18.0  radius   53.0 uT
+W tab5_imu:   static const float MAG_OFFSET[3] = { 36.0f, 36.0f, 18.0f };
+W tab5_imu: mean radius 54.0 uT — should be close to your local field
+```
+
+Set `MAG_CALIBRATE` back to 0, paste the offsets in, rebuild. The values that
+ship in `imu_example.c` are from one particular Tab5 and M135 pairing and will
+not be right for yours.
+
+The three radii should also come out close to each other, since all three
+measure the same field magnitude. If they differ by more than about 15% the
+code says so — but it cannot tell you why. An axis that never reached its
+extremes shrinks its own radius, and so does genuine soft-iron distortion from
+the speaker's steel yoke. Both look identical in a min/max fit.
+
+A related trap: an axis reading `min 0.0` is not evidence of poor coverage. If
+the hard-iron offset is larger than the field radius, that axis never goes
+negative however thoroughly you tumble. And when `min` is exactly zero the
+arithmetic forces `offset == radius`, so their agreement proves nothing.
+
+To find out which you have, set `MAG_CALIBRATE 2` and tumble again. That mode
+applies `MAG_OFFSET` and tracks how much |B| varies with orientation. Earth's
+field has a fixed magnitude, so a good correction leaves it flat:
+
+```
+W tab5_imu: calibration check over 58 samples:
+W tab5_imu:   |B| min 48.2  max 54.1  mean 51.0 uT  spread 12%
+W tab5_imu:   flat: the offsets are good. Compare the mean against your
+W tab5_imu:   local field (~50 uT mid-latitude) to check the scale.
+```
+
+If |B| still swings with orientation, either the offsets are wrong — retry the
+tumble, slower and fuller — or it is soft-iron, which needs per-axis scaling
+that this example does not implement.
+
+Two limits. The calibration is only valid while the module stays in the same
+physical relationship to the Tab5 — reseat it, or move it to another Tab5, and
+redo it. And the field from the voice coil during playback varies with the
+audio, so no static correction removes it; gate your readings if you are
+making sound.
+
 The BMM150 output is compensated microtesla, because Bosch's driver applies
 the factory trim values from the sensor's NVM. Earth's field runs 25-65 uT
 depending on latitude, so the magnitude is a quick sanity check: far outside
 that range means something nearby is magnetised. On a Tab5 the most likely
-culprit is the speaker, a few centimetres from the module. That offset is
-fixed in sensor frame and can be calibrated out by rotating the assembly
-through as many orientations as you can manage and taking the midpoint of
-each axis; the field from the voice coil during playback cannot, since it
-varies with the audio.
+culprit is the speaker; see the calibration section above.
 
 A marginal fix produces a confident, stable, badly wrong altitude. Indoors
 this example reported 1885 m for minutes at a stretch, drifting smoothly, at a

@@ -13,6 +13,7 @@
 #include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "esp_timer.h"
 #include "esp_log.h"
 #include "tab5_bus.h"
 #include "imu_example.h"
@@ -211,6 +212,156 @@ static esp_err_t bmm150_start(bmi270_t *s)
 #endif
 }
 
+// --- magnetometer calibration -------------------------------------------
+//
+// The BMM150 sits a few centimetres from the Tab5's speaker, whose permanent
+// magnet adds a fixed vector in sensor frame. That offset is comparable in
+// size to Earth's field, so uncorrected readings swing between roughly a
+// quarter and double the true magnitude as the board turns, and a heading
+// derived from them is meaningless.
+//
+// The correction is the classic hard-iron one: tumble the assembly through
+// every orientation, take the midpoint of each axis's observed range, and
+// subtract. Set MAG_OFFSET below once you have measured your own, or leave it
+// zeroed and use the live calibration to find them.
+//
+// Only valid while the module stays in the same physical relationship to the
+// Tab5. Reseat it, or move it to another Tab5, and it must be redone. The
+// field from the voice coil during playback is not correctable by any of
+// this, since it varies with the audio.
+
+// Set to 1 to run the tumble calibration at boot instead of applying
+// MAG_OFFSET. Rotate the whole assembly slowly through as many orientations
+// as you can while it runs; a full turn about each of the three axes is the
+// goal, and each axis has to reach both its extremes or the midpoint comes
+// out biased. The result is printed ready to paste into MAG_OFFSET below.
+// 0 = apply MAG_OFFSET and report corrected field (normal operation)
+// 1 = measure offsets by tumbling, then print them for pasting below
+// 2 = apply MAG_OFFSET and check it, by tracking how much |B| varies with
+//     orientation. A good correction leaves |B| constant.
+#define MAG_CALIBRATE      0
+#define MAG_CAL_SECONDS    60
+
+#if MAG_CALIBRATE != 1
+// Measured on one Tab5 + M135 pairing by the tumble calibration below. Yours
+// will differ. Declared only when not calibrating, since IDF builds with
+// -Werror and an unused constant is an error rather than a warning.
+static const float MAG_OFFSET[3] = { 29.5f, 41.5f, 21.0f };
+#endif
+
+#if MAG_CALIBRATE == 1
+static float s_cal_min[3] = { +1e9f, +1e9f, +1e9f };
+static float s_cal_max[3] = { -1e9f, -1e9f, -1e9f };
+static int64_t s_cal_start_us;
+static bool s_cal_done;
+
+static void mag_calibrate(float v[3])
+{
+    if (s_cal_done) return;
+
+    if (!s_cal_start_us) {
+        s_cal_start_us = esp_timer_get_time();
+        ESP_LOGW(TAG, "magnetometer calibration: tumble the Tab5 slowly for %d s",
+                 MAG_CAL_SECONDS);
+    }
+
+    for (int i = 0; i < 3; i++) {
+        if (v[i] < s_cal_min[i]) s_cal_min[i] = v[i];
+        if (v[i] > s_cal_max[i]) s_cal_max[i] = v[i];
+    }
+
+    int64_t elapsed = (esp_timer_get_time() - s_cal_start_us) / 1000000;
+    if (elapsed < MAG_CAL_SECONDS) return;
+
+    s_cal_done = true;
+
+    float off[3], rad[3], mean = 0.0f;
+    for (int i = 0; i < 3; i++) {
+        off[i] = (s_cal_max[i] + s_cal_min[i]) / 2.0f;
+        rad[i] = (s_cal_max[i] - s_cal_min[i]) / 2.0f;
+        mean += rad[i] / 3.0f;
+    }
+
+    ESP_LOGW(TAG, "calibration complete:");
+    for (int i = 0; i < 3; i++) {
+        ESP_LOGW(TAG, "  %c: min %+7.1f  max %+7.1f  offset %+7.1f  radius %6.1f uT",
+                 'X' + i, s_cal_min[i], s_cal_max[i], off[i], rad[i]);
+    }
+    ESP_LOGW(TAG, "  static const float MAG_OFFSET[3] = { %.1ff, %.1ff, %.1ff };",
+             off[0], off[1], off[2]);
+    ESP_LOGW(TAG, "mean radius %.1f uT — should be close to your local field", mean);
+
+    // All three radii measure the same field magnitude, so on a well-sampled
+    // sphere they should come out equal. They often do not, and min/max
+    // calibration cannot tell you why: an axis that never reached its extremes
+    // shrinks its own radius, and so does genuine soft-iron distortion from
+    // nearby steel. Both look identical here.
+    //
+    // Note also that an axis reading min = 0 is not evidence of anything by
+    // itself. If the hard-iron offset exceeds the field radius, that axis never
+    // goes negative however thoroughly you tumble — and when min is exactly 0
+    // the arithmetic forces offset == radius, so their agreement is a
+    // tautology rather than a finding.
+    //
+    // Set MAG_CALIBRATE to 2 to find out which it is.
+    float spread = 0.0f;
+    for (int i = 0; i < 3; i++) {
+        float d = fabsf(rad[i] - mean) / mean;
+        if (d > spread) spread = d;
+    }
+    if (spread > 0.15f) {
+        ESP_LOGW(TAG, "radii differ by %.0f%%: either an axis missed its", spread * 100.0f);
+        ESP_LOGW(TAG, "extremes, or soft-iron distortion. Verify with MAG_CALIBRATE 2");
+    }
+}
+#endif
+
+#if MAG_CALIBRATE == 2
+// Checks a correction rather than producing one. Earth's field has a fixed
+// magnitude, so once the hard-iron offset is removed |B| should be the same
+// whichever way the board points. Residual variation is what is left
+// uncorrected — soft-iron distortion, or an offset that is still wrong.
+static float s_ver_min = +1e9f, s_ver_max = -1e9f, s_ver_sum;
+static int   s_ver_n;
+static int64_t s_ver_start_us;
+static bool s_ver_done;
+
+static void mag_verify(float b)
+{
+    if (s_ver_done) return;
+
+    if (!s_ver_start_us) {
+        s_ver_start_us = esp_timer_get_time();
+        ESP_LOGW(TAG, "checking calibration: tumble again for %d s", MAG_CAL_SECONDS);
+    }
+
+    if (b < s_ver_min) s_ver_min = b;
+    if (b > s_ver_max) s_ver_max = b;
+    s_ver_sum += b;
+    s_ver_n++;
+
+    if ((esp_timer_get_time() - s_ver_start_us) / 1000000 < MAG_CAL_SECONDS) return;
+    s_ver_done = true;
+
+    float avg = s_ver_sum / (float)s_ver_n;
+    float spread = (s_ver_max - s_ver_min) / avg;
+
+    ESP_LOGW(TAG, "calibration check over %d samples:", s_ver_n);
+    ESP_LOGW(TAG, "  |B| min %.1f  max %.1f  mean %.1f uT  spread %.0f%%",
+             s_ver_min, s_ver_max, avg, spread * 100.0f);
+
+    if (spread < 0.15f) {
+        ESP_LOGW(TAG, "  flat: the offsets are good. Compare the mean against your");
+        ESP_LOGW(TAG, "  local field (~50 uT mid-latitude) to check the scale.");
+    } else {
+        ESP_LOGW(TAG, "  still varying with orientation, so something is uncorrected.");
+        ESP_LOGW(TAG, "  Re-run MAG_CALIBRATE 1 with a slower, fuller tumble first;");
+        ESP_LOGW(TAG, "  if the spread persists it is soft-iron and needs per-axis");
+        ESP_LOGW(TAG, "  scaling, which this example does not do.");
+    }
+}
+#endif
+
 // --- reporting ----------------------------------------------------------
 
 static void read_and_log(bmi270_t *s)
@@ -246,13 +397,24 @@ static void imu_task(void *arg)
         if (s_mag_ok) {
             float mx, my, mz;
             if (bosch_aux_bmm150_read_ut(&mx, &my, &mz) == ESP_OK) {
-                // Compensated against the factory trim values in the BMM150's
-                // NVM, so these are microtesla rather than raw counts. Earth's
-                // field runs 25-65 uT depending on latitude; a magnitude far
-                // outside that means something nearby is magnetised — on a
-                // Tab5, most likely the speaker.
-                ESP_LOGI(TAG, "  mag   %+8.2f %+8.2f %+8.2f uT  (|B| %.1f)",
-                         mx, my, mz, sqrtf(mx * mx + my * my + mz * mz));
+#if MAG_CALIBRATE == 1
+                float raw[3] = { mx, my, mz };
+                mag_calibrate(raw);
+#else
+                mx -= MAG_OFFSET[0];
+                my -= MAG_OFFSET[1];
+                mz -= MAG_OFFSET[2];
+#endif
+                // Microtesla: compensated against the BMM150's factory trim
+                // by Bosch's driver, then hard-iron corrected by MAG_OFFSET.
+                // With a good calibration |B| should hold near your local
+                // field (25-65 uT by latitude) through every orientation.
+                // If it still swings, the offsets are wrong or stale.
+                float b = sqrtf(mx * mx + my * my + mz * mz);
+                ESP_LOGI(TAG, "  mag   %+8.2f %+8.2f %+8.2f uT  (|B| %.1f)", mx, my, mz, b);
+#if MAG_CALIBRATE == 2
+                mag_verify(b);
+#endif
             }
         }
 #endif
