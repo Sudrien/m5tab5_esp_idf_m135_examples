@@ -9,6 +9,7 @@
 // The BMM150 is not on this bus at all. It hangs off the BMI270's auxiliary
 // I2C master, so it is reached by asking the 0x69 BMI270 to talk to it.
 
+#include <math.h>
 #include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -23,13 +24,19 @@
 #define HAVE_BMI270_CONFIG 1
 #endif
 
+// Bosch's reference drivers, vendored by tools/fetch_bosch_drivers.sh. Only
+// the magnetometer needs them; accelerometer and gyroscope work without.
+#if __has_include("bmi270.h")
+#include "bosch_aux.h"
+#define HAVE_BOSCH_DRIVERS 1
+#endif
+
 static const char *TAG = "tab5_imu";
 
 // --- BMI270 registers ---------------------------------------------------
 #define BMI270_REG_CHIP_ID        0x00
 #define BMI270_REG_ERR            0x02
 #define BMI270_REG_STATUS         0x03
-#define BMI270_REG_AUX_DATA       0x04
 #define BMI270_REG_ACC_DATA       0x0C
 #define BMI270_REG_GYR_DATA       0x12
 #define BMI270_REG_INTERNAL_STAT  0x21
@@ -37,12 +44,6 @@ static const char *TAG = "tab5_imu";
 #define BMI270_REG_ACC_RANGE      0x41
 #define BMI270_REG_GYR_CONF       0x42
 #define BMI270_REG_GYR_RANGE      0x43
-#define BMI270_REG_AUX_CONF       0x44
-#define BMI270_REG_AUX_DEV_ID     0x4B
-#define BMI270_REG_AUX_IF_CONF    0x4C
-#define BMI270_REG_AUX_RD_ADDR    0x4D
-#define BMI270_REG_AUX_WR_ADDR    0x4E
-#define BMI270_REG_AUX_WR_DATA    0x4F
 #define BMI270_REG_INIT_CTRL      0x59
 #define BMI270_REG_INIT_ADDR_0    0x5B
 #define BMI270_REG_INIT_ADDR_1    0x5C
@@ -53,14 +54,6 @@ static const char *TAG = "tab5_imu";
 
 #define BMI270_CHIP_ID            0x24
 
-// --- BMM150 registers (as seen through the aux interface) ---------------
-#define BMM150_REG_CHIP_ID        0x40
-#define BMM150_REG_DATA           0x42
-#define BMM150_REG_POWER          0x4B
-#define BMM150_REG_OPMODE         0x4C
-#define BMM150_REG_REP_XY         0x51
-#define BMM150_REG_REP_Z          0x52
-#define BMM150_CHIP_ID            0x32
 
 typedef struct {
     const char *label;
@@ -123,6 +116,27 @@ static esp_err_t bmi270_upload_config(bmi270_t *s)
 }
 #endif
 
+// Derives the LSB-per-unit factors from the range registers rather than from
+// what this file thinks it set. Necessary because Bosch's driver reconfigures
+// the M135's BMI270 during magnetometer bring-up: a stale factor silently
+// halves every acceleration reading, which looks like a mounting problem
+// rather than a units bug.
+static void bmi270_refresh_scale(bmi270_t *s)
+{
+    uint8_t acc_range = 0x01, gyr_range = 0x00;
+    tab5_reg_read(s->dev, BMI270_REG_ACC_RANGE, &acc_range, 1);
+    tab5_reg_read(s->dev, BMI270_REG_GYR_RANGE, &gyr_range, 1);
+
+    acc_range &= 0x03;   // 0 = +/-2 g, then 4, 8, 16
+    gyr_range &= 0x07;   // 0 = +/-2000 dps, halving each step down to 125
+
+    s->acc_lsb_per_g   = 32768.0f / (float)(2 << acc_range);
+    s->gyr_lsb_per_dps = 32768.0f / (float)(2000 >> gyr_range);
+
+    ESP_LOGI(TAG, "%s: scale +/-%d g, +/-%d dps", s->label,
+             2 << acc_range, 2000 >> gyr_range);
+}
+
 static esp_err_t bmi270_open(bmi270_t *s)
 {
     esp_err_t err = tab5_bus_add_device(s->addr, &s->dev);
@@ -156,8 +170,7 @@ static esp_err_t bmi270_open(bmi270_t *s)
     ESP_ERROR_CHECK(tab5_reg_write8(s->dev, BMI270_REG_GYR_RANGE, 0x00)); // +/- 2000 dps
     ESP_ERROR_CHECK(tab5_reg_write8(s->dev, BMI270_REG_PWR_CONF, 0x02));  // fifo self-wake
 
-    s->acc_lsb_per_g = 32768.0f / 4.0f;
-    s->gyr_lsb_per_dps = 32768.0f / 2000.0f;
+    bmi270_refresh_scale(s);
     s->configured = true;
     vTaskDelay(pdMS_TO_TICKS(20));
 #else
@@ -166,55 +179,36 @@ static esp_err_t bmi270_open(bmi270_t *s)
     return ESP_OK;
 }
 
-// --- BMM150 through the BMI270's aux master -----------------------------
-
-static esp_err_t aux_write(bmi270_t *s, uint8_t reg, uint8_t val)
-{
-    esp_err_t err = tab5_reg_write8(s->dev, BMI270_REG_AUX_WR_ADDR, reg);
-    if (err != ESP_OK) return err;
-    err = tab5_reg_write8(s->dev, BMI270_REG_AUX_WR_DATA, val);
-    vTaskDelay(pdMS_TO_TICKS(5));
-    return err;
-}
-
-static esp_err_t aux_read(bmi270_t *s, uint8_t reg, uint8_t *buf, size_t len)
-{
-    esp_err_t err = tab5_reg_write8(s->dev, BMI270_REG_AUX_RD_ADDR, reg);
-    if (err != ESP_OK) return err;
-    vTaskDelay(pdMS_TO_TICKS(5));
-    return tab5_reg_read(s->dev, BMI270_REG_AUX_DATA, buf, len);
-}
+// --- BMM150, via Bosch's driver -----------------------------------------
+//
+// The BMI270's auxiliary I2C master is not a bus that can be driven by writing
+// the obvious registers in the obvious order. Its write primitive loads
+// AUX_WR_DATA before AUX_WR_ADDR, because writing the address is what triggers
+// the transaction; it polls an aux_busy bit between operations; and it drops
+// advanced power save around each transfer. A hand-rolled sequence here failed
+// with aux_err on every transaction across several rounds of debugging, and
+// none of the failures pointed at the cause. M5's own library wraps this same
+// Bosch API rather than doing it by hand. See tools/fetch_bosch_drivers.sh.
 
 static esp_err_t bmm150_start(bmi270_t *s)
 {
-    // aux_en, on top of the acc/gyr bits already set.
-    ESP_ERROR_CHECK(tab5_reg_write8(s->dev, BMI270_REG_PWR_CTRL, 0x0F));
-    ESP_ERROR_CHECK(tab5_reg_write8(s->dev, BMI270_REG_AUX_DEV_ID, M135_BMM150_AUX_ADDR << 1));
-    // Manual mode. Burst-read mode would have the BMI270 poll the magnetometer
-    // on its own, but manual keeps the failure modes visible while bringing up.
-    ESP_ERROR_CHECK(tab5_reg_write8(s->dev, BMI270_REG_AUX_IF_CONF, 0x80));
-    ESP_ERROR_CHECK(tab5_reg_write8(s->dev, BMI270_REG_AUX_CONF, 0x08));  // ~100 Hz aux ODR
-    vTaskDelay(pdMS_TO_TICKS(10));
-
-    // Suspend -> sleep. The BMM150 answers nothing at all until this bit is
-    // set, so a chip-ID read before it looks exactly like an absent part.
-    ESP_ERROR_CHECK(aux_write(s, BMM150_REG_POWER, 0x01));
-    vTaskDelay(pdMS_TO_TICKS(10));
-
-    uint8_t id = 0;
-    esp_err_t err = aux_read(s, BMM150_REG_CHIP_ID, &id, 1);
-    if (err != ESP_OK || id != BMM150_CHIP_ID) {
-        ESP_LOGW(TAG, "BMM150 not answering through aux (read 0x%02X, wanted 0x32)", id);
+#ifdef HAVE_BOSCH_DRIVERS
+    if (bosch_aux_bmm150_start(s->addr) != ESP_OK) {
+        ESP_LOGW(TAG, "BMM150 bring-up failed through the Bosch driver");
         return ESP_ERR_NOT_FOUND;
     }
-
-    ESP_ERROR_CHECK(aux_write(s, BMM150_REG_REP_XY, 0x04));  // regular preset
-    ESP_ERROR_CHECK(aux_write(s, BMM150_REG_REP_Z, 0x0E));
-    ESP_ERROR_CHECK(aux_write(s, BMM150_REG_OPMODE, 0x00));  // normal mode
-    vTaskDelay(pdMS_TO_TICKS(10));
-
-    ESP_LOGI(TAG, "BMM150 at aux 0x%02X behind the M135 BMI270", M135_BMM150_AUX_ADDR);
+    // Bosch's init reconfigures this chip's ranges, so re-read them before
+    // the next sample is scaled.
+    bmi270_refresh_scale(s);
+    ESP_LOGI(TAG, "BMM150 at aux 0x%02X behind the M135 BMI270",
+             M135_BMM150_AUX_ADDR);
     return ESP_OK;
+#else
+    ESP_LOGW(TAG, "magnetometer needs Bosch's drivers: run");
+    ESP_LOGW(TAG, "  ./tools/fetch_bosch_drivers.sh");
+    ESP_LOGW(TAG, "then rebuild. Accelerometer and gyroscope are unaffected.");
+    return ESP_ERR_NOT_SUPPORTED;
+#endif
 }
 
 // --- reporting ----------------------------------------------------------
@@ -248,19 +242,20 @@ static void imu_task(void *arg)
         read_and_log(&s_onboard);
         read_and_log(&s_module);
 
+#ifdef HAVE_BOSCH_DRIVERS
         if (s_mag_ok) {
-            uint8_t m[8];
-            if (aux_read(&s_module, BMM150_REG_DATA, m, sizeof(m)) == ESP_OK) {
-                // 13-bit X/Y, 15-bit Z, each left-aligned in its word. These are
-                // raw counts: the BMM150's trim compensation lives in Bosch's
-                // driver and is not reproduced here. Good enough for "is it
-                // moving", not for a calibrated heading.
-                int16_t mx = (int16_t)((m[1] << 8 | (m[0] & 0xF8))) / 8;
-                int16_t my = (int16_t)((m[3] << 8 | (m[2] & 0xF8))) / 8;
-                int16_t mz = (int16_t)((m[5] << 8 | (m[4] & 0xFE))) / 2;
-                ESP_LOGI(TAG, "  mag   %+6d %+6d %+6d (raw counts, uncompensated)", mx, my, mz);
+            float mx, my, mz;
+            if (bosch_aux_bmm150_read_ut(&mx, &my, &mz) == ESP_OK) {
+                // Compensated against the factory trim values in the BMM150's
+                // NVM, so these are microtesla rather than raw counts. Earth's
+                // field runs 25-65 uT depending on latitude; a magnitude far
+                // outside that means something nearby is magnetised — on a
+                // Tab5, most likely the speaker.
+                ESP_LOGI(TAG, "  mag   %+8.2f %+8.2f %+8.2f uT  (|B| %.1f)",
+                         mx, my, mz, sqrtf(mx * mx + my * my + mz * mz));
             }
         }
+#endif
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }

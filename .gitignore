@@ -9,3 +9,7 @@ dependencies.lock
 # carries Bosch's BSD-3-Clause header rather than this repo's MIT, so it is
 # regenerated rather than committed.
 main/bmi270_config_file.h
+
+# Vendored by tools/fetch_bosch_drivers.sh — byte-exact fetches from pinned
+# upstreams, BSD-3-Clause rather than this repo's MIT.
+components/bosch_sensortec/

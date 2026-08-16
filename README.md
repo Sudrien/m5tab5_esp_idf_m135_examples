@@ -89,20 +89,56 @@ device that appears to work and is actually two chips fighting over the same
 address. If your gyro readings are erratic in a way that looks like noise but
 does not scale with motion, check the DIP before the mounting.
 
-### The magnetometer is not on the bus at all
+### The magnetometer is not on the bus at all, and needs Bosch's driver
 
 The BMM150 hangs off the BMI270's **auxiliary I2C master**, not the host bus.
-It will never show up in a scan, no matter how correct everything else is. To
-reach it you configure the M135's BMI270 as an I2C master (`AUX_DEV_ID`,
-`AUX_IF_CONF`) and read the magnetometer through `AUX_RD_ADDR` / `AUX_DATA`.
+It never shows up in a scan, no matter how correct everything else is. The
+schematic confirms the topology: its SDI/SCK go to the BMI270's `ASDX`/`ASCX`
+pins as `BMM_SDA`/`BMM_SCL`, it is powered directly from `+3.3V` with no gate,
+and `SDO` is tied low, fixing the address at `0x10`.
 
-Which means the magnetometer depends on the BMI270 being fully initialised,
-which means it depends on the config file below. A missing blob shows up as a
-dead magnetometer three layers away from the actual cause.
+Reaching it is the hard part, and this example does not attempt it by hand.
+The aux master is not a bus you can drive by writing the obvious registers in
+the obvious order:
 
-The BMM150 also boots into suspend and answers *nothing* — not even its chip
-ID — until `0x4B` bit 0 is set. A chip-ID probe before that write is
-indistinguishable from an absent part.
+- The write primitive loads `AUX_WR_DATA` **before** `AUX_WR_ADDR`, because
+  writing the address is what triggers the transaction. Address-then-data
+  sends whatever byte the previous call left behind.
+- An `aux_busy` bit in `STATUS` has to be polled between operations.
+- Advanced power save has to be dropped around each transfer and restored
+  after.
+
+A hand-rolled sequence here failed with `aux_err` (`ERR_REG` bit 7) on every
+single transaction, through several rounds of debugging that ruled out
+timing, the address shift, the power-control ordering, and the internal
+pull-up selection in `AUX_IF_TRIM`. None of the failures pointed at the cause.
+M5's own library wraps Bosch's API rather than doing this by hand, and the
+one M5 example that reads the magnetometer has a bug that prints the
+accelerometer values instead — so it was probably never watched working.
+
+So: vendor the reference drivers.
+
+```
+./tools/fetch_bosch_drivers.sh
+idf.py build flash monitor
+```
+
+That pulls `bmi2.c`, `bmi270.c` and `bmm150.c` into
+`components/bosch_sensortec/`, and `main/bosch_aux.c` is a thin glue layer
+over them. Both are BSD-3-Clause and gitignored, for the same reason as the
+config blob: byte-exact fetches from pinned upstreams under a different
+licence to this repo.
+
+Accelerometer and gyroscope work without any of this. Skip the script and you
+get everything except the magnetometer, with a message saying so rather than
+a silent failure.
+
+Two consequences worth knowing. The Bosch driver reconfigures the M135's
+BMI270 ranges during magnetometer bring-up, so `imu_example.c` re-reads
+`ACC_RANGE` and `GYR_RANGE` afterwards and derives its scale factors from the
+hardware — assuming the range you set earlier silently halves every reading.
+And once the drivers are vendored, `tools/fetch_bmi270_config.sh` is
+redundant: the 8 KB config image ships inside `bmi270.c`.
 
 ### The BMI270 needs an 8 KB firmware upload before it does anything
 
@@ -253,8 +289,12 @@ tab5_gnss: watching 1PPS on G51 (M5-Bus pin 26)
 tab5_baro: BMP280 at 0x76, chip ID 0x58
 tab5_imu: Tab5: BMI270 at 0x68
 tab5_imu: Tab5: config uploaded, internal status ok
+tab5_imu: Tab5: scale +/-4 g, +/-2000 dps
 tab5_imu: M135: BMI270 at 0x69
 tab5_imu: M135: config uploaded, internal status ok
+tab5_imu: M135: scale +/-4 g, +/-2000 dps
+bosch_aux: bmm150_init ok, chip ID 0x32
+tab5_imu: M135: scale +/-8 g, +/-2000 dps
 tab5_imu: BMM150 at aux 0x10 behind the M135 BMI270
 ```
 
@@ -269,9 +309,9 @@ tab5_gnss:   speed      0.560 kn, course - deg
 tab5_gnss: PPS 30 pulses, last interval 1000023 us (+23 us from 1 s)
 tab5_baro: 994.87 hPa, 29.76 C, 154.2 m (vs 1013.25 hPa reference)
 tab5_imu: ---
-tab5_imu:   Tab5  acc  +0.012  -0.004  +0.998 g   gyr    +0.06    -0.12    +0.01 dps
-tab5_imu:   M135  acc  -0.007  +0.019  +1.001 g   gyr    -0.09    +0.04    -0.03 dps
-tab5_imu:   mag    +142   -318   -211 (raw counts, uncompensated)
+tab5_imu:   Tab5  acc  -0.019  -0.135  -0.974 g   gyr    -0.12    +0.06    +0.06 dps
+tab5_imu:   M135  acc  +0.141  -0.016  -1.024 g   gyr    -0.24    -0.24    +0.18 dps
+tab5_imu:   mag     +29.00  +78.00  -35.00 uT  (|B| 90.3)
 ```
 
 Indoors, where the fix is marginal or absent:
@@ -303,12 +343,15 @@ should agree, and the size of the disagreement is a usable measure of how much
 to trust either. The onboard one is treated as optional — failing to open it
 logs a warning and the module continues.
 
-The BMM150 output is raw counts. Bosch's trim compensation reads a dozen
-factory registers and applies a piecewise correction that is genuinely fiddly
-to get right, and reproducing it here badly would be worse than not doing it:
-uncompensated counts are honestly labelled and fine for "is it moving", while
-a subtly wrong compensation looks authoritative and is not. For a calibrated
-heading, use Bosch's driver.
+The BMM150 output is compensated microtesla, because Bosch's driver applies
+the factory trim values from the sensor's NVM. Earth's field runs 25-65 uT
+depending on latitude, so the magnitude is a quick sanity check: far outside
+that range means something nearby is magnetised. On a Tab5 the most likely
+culprit is the speaker, a few centimetres from the module. That offset is
+fixed in sensor frame and can be calibrated out by rotating the assembly
+through as many orientations as you can manage and taking the midpoint of
+each axis; the field from the voice coil during playback cannot, since it
+varies with the audio.
 
 A marginal fix produces a confident, stable, badly wrong altitude. Indoors
 this example reported 1885 m for minutes at a stretch, drifting smoothly, at a
@@ -332,11 +375,6 @@ Altitude from the BMP280 is against a hardcoded 1013.25 hPa standard
 atmosphere, not your local QNH, so treat it as relative unless you feed it a
 real reference. The IIR filter is set to x16 — without it the altitude jitters
 by several metres and reads as a broken sensor.
-
-The aux interface runs in manual mode rather than burst-read mode. Burst mode
-has the BMI270 poll the magnetometer on its own and drop the results into its
-data registers, which is what you want in production; manual keeps each
-transaction visible while bringing the thing up.
 
 The GNSS parser handles GGA and RMC and ignores the rest. GSV would give
 per-satellite signal strength and GSA the fix mode and DOP breakdown, both of
@@ -362,6 +400,6 @@ and is not in this example.
 
 ## Licence
 
-MIT, see `LICENSE`. The BMI270 configuration image fetched by
-`tools/fetch_bmi270_config.sh` is Bosch's, BSD-3-Clause, extracted unmodified
-from their reference driver.
+MIT, see `LICENSE`. The BMI270 configuration image and the BMI270/BMM150
+reference drivers, fetched by `tools/fetch_bmi270_config.sh` and
+`tools/fetch_bosch_drivers.sh`, are Bosch's, BSD-3-Clause, used unmodified.
